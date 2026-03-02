@@ -8,10 +8,11 @@ from requests.adapters import HTTPAdapter
 from urllib3.poolmanager import PoolManager
 from urllib3.util import ssl_
 import urllib3
+import time
 
 app = Flask(__name__)
 
-# === 보안 무시 어댑터 (기존과 동일) ===
+# === 보안 설정 (기존 동일) ===
 class LegacySSLAdapter(HTTPAdapter):
     def init_poolmanager(self, connections, maxsize, block=False):
         context = ssl_.create_urllib3_context(ciphers='DEFAULT@SECLEVEL=1')
@@ -19,83 +20,62 @@ class LegacySSLAdapter(HTTPAdapter):
         context.verify_mode = ssl.CERT_NONE
         self.poolmanager = PoolManager(num_pools=connections, maxsize=maxsize, block=block, ssl_context=context)
 
-# === ⭐️ [수정됨] 키워드를 받아서 처리하는 함수 ===
-def get_notices(url, user_keyword):
-    url = url.strip()
-    if not url.startswith("http"):
-        url = "https://" + url
-    
-    result_list = []
-    
+def create_session():
+    session = requests.Session()
+    session.mount('https://', LegacySSLAdapter())
+    return session
+
+def get_soup(session, url):
     try:
-        session = requests.Session()
-        session.mount('https://', LegacySSLAdapter()) 
         headers = {'User-Agent': 'Mozilla/5.0'}
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        
-        # 1차 접속
-        response = session.get(url, headers=headers, timeout=10, verify=False)
+        response = session.get(url, headers=headers, timeout=5, verify=False)
         response.encoding = 'utf-8'
-        soup = BeautifulSoup(response.text, 'html.parser')
+        return BeautifulSoup(response.text, 'html.parser')
+    except:
+        return None
 
-        # 리다이렉트 체크
-        meta_refresh = soup.find('meta', attrs={'http-equiv': re.compile(r'refresh', re.I)})
-        if meta_refresh:
-            content = meta_refresh.get('content', '')
-            if 'url=' in content:
-                new_path = content.split('url=')[-1].strip()
-                url = urljoin(url, new_path)
-                response = session.get(url, headers=headers, timeout=10, verify=False)
-                response.encoding = 'utf-8'
-                soup = BeautifulSoup(response.text, 'html.parser')
+# === ⭐️ [핵심] 2단계: 게시판 안으로 들어가서 키워드 찾기 ===
+def deep_search(session, board_url, keyword):
+    print(f"   👉 게시판 내부 진입: {board_url}")
+    soup = get_soup(session, board_url)
+    if not soup: return []
 
-        # 링크 찾기
-        links = soup.find_all('a')
-        
-        # ⭐️ [핵심] 사용자가 키워드를 줬으면 그것만 쓰고, 없으면 기본값 사용
-        if user_keyword:
-            keywords = [user_keyword] # 사용자가 입력한 단어 하나만 타겟팅
-        else:
-            keywords = ['공지', 'Notice', 'news', '게시판'] # 기본값
-
-        found_urls = set()
-
-        for link in links:
-            text = link.get_text().strip()
-            href = link.get('href')
-            
-            if not href or not text: continue
-            if 'javascript' in href or '#' == href: continue
-
-            # 키워드 검사
-            for key in keywords:
-                if key in text: # 대소문자 구분을 없애려면 .lower() 사용 가능
-                    full_url = urljoin(url, href)
-                    if full_url not in found_urls:
-                        result_list.append({
-                            "title": text,
-                            "link": full_url
-                        })
-                        found_urls.add(full_url)
-                    break 
-        
-        return {"status": "success", "data": result_list[:15]} # 15개 정도 가져오기
-
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-# === API 경로 설정 ===
-@app.route('/search', methods=['GET'])
-def search_api():
-    target_url = request.args.get('url')
-    keyword = request.args.get('keyword') # ⭐️ URL에서 키워드 꺼내기
+    results = []
+    links = soup.find_all('a')
     
-    if not target_url:
-        return jsonify({"status": "error", "message": "URL을 입력해주세요."})
+    for link in links:
+        text = link.get_text().strip()
+        href = link.get('href')
+        
+        if not text or not href: continue
+        if 'javascript' in href or '#' == href: continue
+        
+        # 여기서 사용자의 키워드가 제목에 있는지 검사!
+        if keyword in text:
+            full_url = urljoin(board_url, href)
+            results.append({"title": text, "link": full_url})
     
-    # 크롤링 실행 (키워드 전달)
-    result = get_notices(target_url, keyword)
-    return jsonify(result)
+    return results
 
-if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=5001, debug=True)
+# === 메인 로직 ===
+def get_notices(url, user_keyword):
+    url = url.strip()
+    if not url.startswith("http"): url = "https://" + url
+    
+    session = create_session()
+    soup = get_soup(session, url)
+    
+    if not soup: return {"status": "error", "message": "접속 실패"}
+
+    # 1. 메인 페이지 리다이렉트 처리 (쪽지 따라가기)
+    meta_refresh = soup.find('meta', attrs={'http-equiv': re.compile(r'refresh', re.I)})
+    if meta_refresh:
+        content = meta_refresh.get('content', '')
+        if 'url=' in content:
+            new_path = content.split('url=')[-1].strip()
+            url = urljoin(url, new_path)
+            soup = get_soup(session, url)
+
+    final_results = []
+    seen_urls = set()
