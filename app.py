@@ -6,11 +6,10 @@ from requests.adapters import HTTPAdapter
 from urllib3.poolmanager import PoolManager
 from urllib3.util import ssl_
 import urllib3
-import time
 
 app = Flask(__name__)
 
-# === 1. 보안 무시 어댑터 ===
+# === 보안 설정 ===
 class LegacySSLAdapter(HTTPAdapter):
     def init_poolmanager(self, connections, maxsize, block=False):
         context = ssl_.create_urllib3_context(ciphers='DEFAULT@SECLEVEL=1')
@@ -22,58 +21,48 @@ def get_soup(url):
     try:
         session = requests.Session()
         session.mount('https://', LegacySSLAdapter())
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
-        }
+        headers = {'User-Agent': 'Mozilla/5.0'}
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        # 타임아웃을 5초로 설정 (여러 페이지 돌려면 빨라야 함)
-        response = session.get(url, headers=headers, timeout=5, verify=False)
+        response = session.get(url, headers=headers, timeout=8, verify=False)
         response.encoding = 'utf-8' 
-        return BeautifulSoup(response.text, 'html.parser'), response.status_code, len(response.text)
-    except Exception as e:
-        print(f"Error: {e}")
-        return None, 500, 0
+        return BeautifulSoup(response.text, 'html.parser')
+    except:
+        return None
 
-# === 2. 페이지 자동 넘김 크롤러 (핵심 기능) ===
-def scrape_with_pagination(base_url, keyword, max_pages=225):
+# === 🌐 V10: 월드 와이드 스마트 검색 ===
+def smart_search(base_url, keyword):
     base_url = base_url.strip()
     if not base_url.startswith("http"): base_url = "https://" + base_url
     
-    print(f"🚀 [자동화 시작] '{keyword}' 검색 시작 (최대 {max_pages}페이지 탐색)")
+    # ? 뒷부분 제거 (순수 URL만 남김)
+    clean_url = base_url.split('?')[0]
+    
+    print(f"🚀 [V10 글로벌 검색] '{keyword}' 탐색 시작...")
+    
+    # ⭐️ 전 세계 웹사이트 검색 변수 TOP 7
+    # 이 리스트에 있는 걸 순서대로 다 찔러봅니다.
+    search_params = [
+        "searchKeyword", # 한국 공공기관/대학 표준 (1순위)
+        "q",             # 구글, 글로벌 표준 (2순위)
+        "s",             # 워드프레스(WordPress) 전 세계 40% 점유 (3순위)
+        "query",         # 네이버, 다음, 많은 포털형 사이트
+        "kwd",           # Keyword 약자 (한국 사이트 자주 씀)
+        "keyword",       # 정직한 변수명
+        "srSearchVal"    # 옛날 게시판 솔루션
+    ]
     
     all_results = []
     seen_links = set()
-    prev_page_size = 0 # 페이지가 끝났는지 확인용
     
-    # 1페이지부터 max_pages까지 반복
-    for page in range(1, max_pages + 1):
-        # URL 만들기 (이미 파라미터가 있으면 &pageIndex=, 없으면 ?pageIndex=)
-        # 전북대 등 대부분의 공공 사이트는 'pageIndex' 또는 'page'를 씁니다.
-        if "pageIndex=" in base_url or "page=" in base_url:
-            # 이미 페이지 정보가 있으면 그건 1페이지로 간주하고 첫 턴만 돔 (복잡해짐 방지)
-            current_url = base_url 
-        else:
-            separator = "&" if "?" in base_url else "?"
-            # 전북대 표준 파라미터인 pageIndex를 우선 사용
-            current_url = f"{base_url}{separator}pageIndex={page}"
-            
-        print(f"   Reading Page {page}: {current_url}")
+    for param in search_params:
+        target_url = f"{clean_url}?{param}={keyword}"
+        # print(f"   👉 찌르는 중: ?{param}=") # 로그 너무 많으면 주석 처리
         
-        soup, status, content_size = get_soup(current_url)
+        soup = get_soup(target_url)
+        if not soup: continue
         
-        if not soup or status != 200:
-            print("   -> 접속 실패 또는 끝")
-            break
-            
-        # (옵션) 이전 페이지와 내용 길이가 똑같으면 '마지막 페이지'라고 판단하고 종료
-        if page > 1 and abs(content_size - prev_page_size) < 50:
-            print("   -> 페이지 내용이 변하지 않음. 마지막 페이지 도달.")
-            break
-        prev_page_size = content_size
-
-        # 링크 수집
         links = soup.find_all('a')
-        found_on_this_page = 0
+        found_count = 0
         
         for link in links:
             text = link.get_text().strip()
@@ -82,58 +71,47 @@ def scrape_with_pagination(base_url, keyword, max_pages=225):
             if not text or not href: continue
             if 'javascript' in href or '#' in href: continue
             
-            # 키워드 검사 (공백 무시)
             clean_text = text.replace(" ", "")
-            clean_keyword = keyword.replace(" ", "") if keyword else ""
+            clean_keyword = keyword.replace(" ", "")
             
-            if (keyword and clean_keyword in clean_text) or (not keyword and len(text) > 5):
-                # URL 합치기
+            # 검색 결과에서 키워드 발견!
+            if clean_keyword in clean_text:
                 if not href.startswith("http"):
                     base_root = "/".join(base_url.split('/')[:3])
                     if href.startswith("/"):
                         full_url = base_root + href
                     else:
-                        # 현재 경로 기준 합치기
-                        path_url = base_url.split('?')[0] # 쿼리 떼고
-                        path_url = "/".join(path_url.split('/')[:-1])
-                        full_url = path_url + "/" + href
+                        full_url = "/".join(clean_url.split('/')[:-1]) + "/" + href
                 else:
                     full_url = href
-
+                
                 if full_url not in seen_links:
-                    all_results.append({"title": f"[{page}p] {text}", "link": full_url})
+                    all_results.append({"title": text, "link": full_url})
                     seen_links.add(full_url)
-                    found_on_this_page += 1
+                    found_count += 1
         
-        print(f"   -> {found_on_this_page}개 발견")
-        
-        # 만약 사용자가 URL에 이미 page를 넣었으면 1번만 돌고 종료
-        if current_url == base_url:
+        # 하나라도 찾았으면 그 변수가 정답이므로 반복문 종료! (시간 절약)
+        if found_count > 0:
+            print(f"   ✅ 성공! 정답 변수는 '?{param}=' 였습니다. ({found_count}개 발견)")
             break
             
-        # 너무 빨리 긁으면 차단당하니까 0.5초 휴식
-        time.sleep(0.5)
-
     return all_results
 
 # === 서버 경로 ===
 @app.route('/', methods=['GET'])
 def home():
-    return "V8: Auto-Pagination Walker (페이지 자동 넘김 모드)"
+    return "V10: World-Wide Search Mode (글로벌 호환성 패치)"
 
 @app.route('/search', methods=['GET'])
 def search_api():
     target_url = request.args.get('url')
     keyword = request.args.get('keyword')
+    if not target_url: return jsonify({"status": "error", "message": "URL 필요"})
     
-    if not target_url:
-        return jsonify({"status": "error", "message": "URL 필요"})
-    
-    # 페이지 자동 넘김 크롤러 실행
-    results = scrape_with_pagination(target_url, keyword, max_pages=225) # 5페이지까지 뒤짐
+    results = smart_search(target_url, keyword)
     
     if not results:
-        return jsonify({"status": "success", "data": [], "message": "225페이지까지 뒤져봤지만 글이 없습니다."})
+        return jsonify({"status": "success", "data": [], "message": "모든 검색 방법을 시도했으나 실패했습니다."})
         
     return jsonify({"status": "success", "data": results})
 
