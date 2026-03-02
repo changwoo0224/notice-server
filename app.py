@@ -6,10 +6,11 @@ from requests.adapters import HTTPAdapter
 from urllib3.poolmanager import PoolManager
 from urllib3.util import ssl_
 import urllib3
+import time
 
 app = Flask(__name__)
 
-# === 1. 강력한 보안 무시 어댑터 ===
+# === 1. 보안 무시 어댑터 ===
 class LegacySSLAdapter(HTTPAdapter):
     def init_poolmanager(self, connections, maxsize, block=False):
         context = ssl_.create_urllib3_context(ciphers='DEFAULT@SECLEVEL=1')
@@ -21,108 +22,104 @@ def get_soup(url):
     try:
         session = requests.Session()
         session.mount('https://', LegacySSLAdapter())
-        
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
         }
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        
-        # 5초 안에 응답 없으면 포기 (속도 향상)
+        # 타임아웃을 5초로 설정 (여러 페이지 돌려면 빨라야 함)
         response = session.get(url, headers=headers, timeout=5, verify=False)
-        response.encoding = 'utf-8' # 한글 깨짐 방지
-        return BeautifulSoup(response.text, 'html.parser'), response.status_code
+        response.encoding = 'utf-8' 
+        return BeautifulSoup(response.text, 'html.parser'), response.status_code, len(response.text)
     except Exception as e:
-        print(f"에러: {e}")
-        return None, 500
+        print(f"Error: {e}")
+        return None, 500, 0
 
-# === 2. 범용 게시판 털기 로직 ===
-def scrape_any_board(url, keyword):
-    url = url.strip()
-    if not url.startswith("http"): url = "https://" + url
+# === 2. 페이지 자동 넘김 크롤러 (핵심 기능) ===
+def scrape_with_pagination(base_url, keyword, max_pages=20):
+    base_url = base_url.strip()
+    if not base_url.startswith("http"): base_url = "https://" + base_url
     
-    print(f"🔍 [직접 접속] {url} 에서 '{keyword}' 찾는 중...")
+    print(f"🚀 [자동화 시작] '{keyword}' 검색 시작 (최대 {max_pages}페이지 탐색)")
     
-    soup, status = get_soup(url)
-    if not soup:
-        return {"status": "error", "message": f"사이트 접속 불가 (코드: {status})"}
-
-    results = []
+    all_results = []
     seen_links = set()
+    prev_page_size = 0 # 페이지가 끝났는지 확인용
     
-    # 전략: 게시판은 보통 <a> 태그 안에 제목이 있다.
-    # 모든 링크를 다 가져와서 검사한다.
-    links = soup.find_all('a')
-    
-    # 만약 키워드가 없으면? -> 그냥 상위 15개 글을 가져옴
-    if not keyword:
-        for link in links:
-            text = link.get_text().strip()
-            href = link.get('href')
-            if len(text) > 5 and href: # 제목이 너무 짧으면(예: '홈') 패스
-                # 자바스크립트 링크는 앱에서 못 여니까 제외
-                if 'javascript' in href or '#' in href: continue
-                
-                # 절대 경로로 변환
-                if not href.startswith("http"):
-                    # 주소 합치기 로직 단순화
-                    base_url = "/".join(url.split('/')[:3]) # https://site.com
-                    if href.startswith("/"):
-                        full_url = base_url + href
-                    else:
-                        full_url = url + "/" + href # 단순 무식하게 합치기 (오히려 잘 됨)
-                else:
-                    full_url = href
+    # 1페이지부터 max_pages까지 반복
+    for page in range(1, max_pages + 1):
+        # URL 만들기 (이미 파라미터가 있으면 &pageIndex=, 없으면 ?pageIndex=)
+        # 전북대 등 대부분의 공공 사이트는 'pageIndex' 또는 'page'를 씁니다.
+        if "pageIndex=" in base_url or "page=" in base_url:
+            # 이미 페이지 정보가 있으면 그건 1페이지로 간주하고 첫 턴만 돔 (복잡해짐 방지)
+            current_url = base_url 
+        else:
+            separator = "&" if "?" in base_url else "?"
+            # 전북대 표준 파라미터인 pageIndex를 우선 사용
+            current_url = f"{base_url}{separator}pageIndex={page}"
+            
+        print(f"   Reading Page {page}: {current_url}")
+        
+        soup, status, content_size = get_soup(current_url)
+        
+        if not soup or status != 200:
+            print("   -> 접속 실패 또는 끝")
+            break
+            
+        # (옵션) 이전 페이지와 내용 길이가 똑같으면 '마지막 페이지'라고 판단하고 종료
+        if page > 1 and abs(content_size - prev_page_size) < 50:
+            print("   -> 페이지 내용이 변하지 않음. 마지막 페이지 도달.")
+            break
+        prev_page_size = content_size
 
-                if full_url not in seen_links:
-                    results.append({"title": text, "link": full_url})
-                    seen_links.add(full_url)
-                    if len(results) >= 15: break
-    
-    # 키워드가 있으면? -> 그것만 찾음
-    else:
+        # 링크 수집
+        links = soup.find_all('a')
+        found_on_this_page = 0
+        
         for link in links:
             text = link.get_text().strip()
             href = link.get('href')
             
             if not text or not href: continue
+            if 'javascript' in href or '#' in href: continue
             
-            # ⭐️ 검색어 매칭 (공백 제거 후 비교)
+            # 키워드 검사 (공백 무시)
             clean_text = text.replace(" ", "")
-            clean_keyword = keyword.replace(" ", "")
+            clean_keyword = keyword.replace(" ", "") if keyword else ""
             
-            if clean_keyword in clean_text:
-                if 'javascript' in href or '#' in href: continue
-
+            if (keyword and clean_keyword in clean_text) or (not keyword and len(text) > 5):
+                # URL 합치기
                 if not href.startswith("http"):
-                    base_url = "/".join(url.split('/')[:3])
+                    base_root = "/".join(base_url.split('/')[:3])
                     if href.startswith("/"):
-                        full_url = base_url + href
+                        full_url = base_root + href
                     else:
-                        # 상대 경로 처리가 복잡하므로, 단순하게 처리
-                        full_url = base_url + href 
+                        # 현재 경로 기준 합치기
+                        path_url = base_url.split('?')[0] # 쿼리 떼고
+                        path_url = "/".join(path_url.split('/')[:-1])
+                        full_url = path_url + "/" + href
                 else:
                     full_url = href
-                
+
                 if full_url not in seen_links:
-                    results.append({"title": text, "link": full_url})
+                    all_results.append({"title": f"[{page}p] {text}", "link": full_url})
                     seen_links.add(full_url)
+                    found_on_this_page += 1
+        
+        print(f"   -> {found_on_this_page}개 발견")
+        
+        # 만약 사용자가 URL에 이미 page를 넣었으면 1번만 돌고 종료
+        if current_url == base_url:
+            break
+            
+        # 너무 빨리 긁으면 차단당하니까 0.5초 휴식
+        time.sleep(0.5)
 
-    # 결과가 없으면? 디버깅용 메시지 추가
-    if not results:
-        title = soup.title.string if soup.title else "제목 없음"
-        return {
-            "status": "success", 
-            "data": [], 
-            "message": f"'{title}' 페이지에 접속은 했는데, '{keyword}' 관련 글을 못 찾았습니다. 주소가 게시판 목록이 맞나요?"
-        }
-
-    return {"status": "success", "data": results}
+    return all_results
 
 # === 서버 경로 ===
 @app.route('/', methods=['GET'])
 def home():
-    return "V6: Direct Board Link Mode (게시판 주소를 직접 넣으세요!)"
+    return "V8: Auto-Pagination Walker (페이지 자동 넘김 모드)"
 
 @app.route('/search', methods=['GET'])
 def search_api():
@@ -130,10 +127,15 @@ def search_api():
     keyword = request.args.get('keyword')
     
     if not target_url:
-        return jsonify({"status": "error", "message": "URL을 입력해주세요."})
+        return jsonify({"status": "error", "message": "URL 필요"})
     
-    result = scrape_any_board(target_url, keyword)
-    return jsonify(result)
+    # 페이지 자동 넘김 크롤러 실행
+    results = scrape_with_pagination(target_url, keyword, max_pages=5) # 5페이지까지 뒤짐
+    
+    if not results:
+        return jsonify({"status": "success", "data": [], "message": "5페이지까지 뒤져봤지만 글이 없습니다."})
+        
+    return jsonify({"status": "success", "data": results})
 
 if __name__ == "__main__":
     app.run(host='0.0.0.0', port=5001)
