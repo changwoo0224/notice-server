@@ -7,7 +7,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.poolmanager import PoolManager
 from urllib3.util import ssl_
 import urllib3
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+from urllib.parse import urlparse, parse_qs
 
 app = Flask(__name__)
 
@@ -26,7 +26,6 @@ def get_soup(url, params=None):
         headers = {'User-Agent': 'Mozilla/5.0'}
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         
-        # 타임아웃 5초
         response = session.get(url, headers=headers, params=params, timeout=5, verify=False)
         response.encoding = 'utf-8' 
         return BeautifulSoup(response.text, 'html.parser'), response.url
@@ -34,25 +33,40 @@ def get_soup(url, params=None):
         print(f"Error: {e}")
         return None, ""
 
-# === 2. V16: 파라미터 보존 + 조건 검색 ===
-def search_jbnu_logic(target_url, keyword):
+# === 2. V17: 방 번호(Menu ID) 자동 탐지 및 검색 ===
+def search_smart_auto(target_url, keyword):
     if not target_url.startswith("http"): target_url = "https://" + target_url
     
-    # URL 분해
+    # 1. 일단 접속해서 '방 번호(menu)'가 있는지 확인
     parsed = urlparse(target_url)
-    base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-    
-    # 기존 파라미터 가져오기 (menu=2377 등을 살리기 위함)
     current_params = parse_qs(parsed.query)
     clean_params = {k: v[0] for k, v in current_params.items()}
     
-    # ⭐️ 핵심: 전북대 검색 조건 강제 주입
+    # 기본 URL (파라미터 뗀 것)
+    base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+    # 만약 URL에 'menu'가 없으면? -> 직접 페이지 뜯어서 찾아냄!
+    if 'menu' not in clean_params:
+        print(f"🕵️ [자동 탐지] URL에 방 번호가 없습니다. {base_url}에서 찾는 중...")
+        soup_init, _ = get_soup(base_url, params=clean_params)
+        
+        if soup_init:
+            # HTML 안에 숨겨진 <input name="menu" value="2377"> 을 찾는다.
+            hidden_menu = soup_init.find('input', {'name': 'menu'})
+            if hidden_menu and hidden_menu.get('value'):
+                found_menu = hidden_menu.get('value')
+                clean_params['menu'] = found_menu
+                print(f"   ✅ 방 번호 발견! 자동 적용: menu={found_menu}")
+            else:
+                print("   ⚠️ 방 번호를 못 찾았습니다. 그냥 진행합니다.")
+
+    # 2. 검색 조건 강제 주입
     clean_params['searchKeyword'] = keyword
-    clean_params['searchCondition'] = '0' # 0=제목, 1=내용
+    clean_params['searchCondition'] = '0' # 제목 검색
     
-    # 접속!
+    # 3. 진짜 검색 접속
     soup, final_url = get_soup(base_url, params=clean_params)
-    print(f"👉 접속 시도 URL: {final_url}") 
+    print(f"👉 최종 접속 URL: {final_url}") 
 
     if not soup: return []
 
@@ -67,10 +81,10 @@ def search_jbnu_logic(target_url, keyword):
         if not text or not href: continue
         if 'javascript' in href or '#' in href: continue
         
-        # 키워드 매칭 (공백 제거 후 확인)
         clean_text = text.replace(" ", "")
         clean_keyword = keyword.replace(" ", "")
         
+        # 키워드 매칭
         if clean_keyword in clean_text:
             if not href.startswith("http"):
                 if href.startswith("/"):
@@ -89,7 +103,7 @@ def search_jbnu_logic(target_url, keyword):
 
 @app.route('/', methods=['GET'])
 def home():
-    return "V16: Server is Running! (Port Fixed)"
+    return "V17: Auto-Menu Detection (짧은 주소 지원 모드)"
 
 @app.route('/search', methods=['GET'])
 def search_api():
@@ -99,15 +113,13 @@ def search_api():
     if not target_url: return jsonify({"status": "error", "message": "URL 필요"})
     if not keyword: return jsonify({"status": "error", "message": "키워드 필요"})
 
-    results = search_jbnu_logic(target_url, keyword)
+    results = search_smart_auto(target_url, keyword)
     
     if not results:
         return jsonify({"status": "success", "data": [], "message": "검색 결과 없음"})
         
     return jsonify({"status": "success", "data": results})
 
-# === ⭐️ 여기가 문제였습니다! 포트 번호 수정 ===
 if __name__ == "__main__":
-    # Render가 주는 포트 번호를 받아서 씁니다. 없으면 5001번.
     port = int(os.environ.get("PORT", 5001))
     app.run(host='0.0.0.0', port=port)
