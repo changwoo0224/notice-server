@@ -35,7 +35,7 @@ def get_soup(url):
         return None, 500, 0
 
 # === 2. 페이지 자동 넘김 크롤러 (핵심 기능) ===
-def scrape_with_pagination(base_url, keyword, max_pages=20):
+def scrape_with_pagination(base_url, keyword, max_pages=100):
     base_url = base_url.strip()
     if not base_url.startswith("http"): base_url = "https://" + base_url
     
@@ -130,10 +130,10 @@ def search_api():
         return jsonify({"status": "error", "message": "URL 필요"})
     
     # 페이지 자동 넘김 크롤러 실행
-    results = scrape_with_pagination(target_url, keyword, max_pages=5) # 5페이지까지 뒤짐
+    results = scrape_with_pagination(target_url, keyword, max_pages=100) # 5페이지까지 뒤짐
     
     if not results:
-        return jsonify({"status": "success", "data": [], "message": "5페이지까지 뒤져봤지만 글이 없습니다."})
+        return jsonify({"status": "success", "data": [], "message": "100페이지까지 뒤져봤지만 글이 없습니다."})
         
     return jsonify({"status": "success", "data": results})
 
