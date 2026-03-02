@@ -1,9 +1,7 @@
 from flask import Flask, request, jsonify
 import requests
 import ssl
-import re
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin
 from requests.adapters import HTTPAdapter
 from urllib3.poolmanager import PoolManager
 from urllib3.util import ssl_
@@ -11,7 +9,7 @@ import urllib3
 
 app = Flask(__name__)
 
-# === 1. 보안 무시 어댑터 (한국 사이트 접속 필수템) ===
+# === 1. 강력한 보안 무시 어댑터 ===
 class LegacySSLAdapter(HTTPAdapter):
     def init_poolmanager(self, connections, maxsize, block=False):
         context = ssl_.create_urllib3_context(ciphers='DEFAULT@SECLEVEL=1')
@@ -19,139 +17,122 @@ class LegacySSLAdapter(HTTPAdapter):
         context.verify_mode = ssl.CERT_NONE
         self.poolmanager = PoolManager(num_pools=connections, maxsize=maxsize, block=block, ssl_context=context)
 
-def create_session():
-    session = requests.Session()
-    session.mount('https://', LegacySSLAdapter())
-    return session
-
-def get_soup(session, url):
+def get_soup(url):
     try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+        session = requests.Session()
+        session.mount('https://', LegacySSLAdapter())
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+        }
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        response = session.get(url, headers=headers, timeout=8, verify=False)
+        
+        # 5초 안에 응답 없으면 포기 (속도 향상)
+        response = session.get(url, headers=headers, timeout=5, verify=False)
         response.encoding = 'utf-8' # 한글 깨짐 방지
-        return BeautifulSoup(response.text, 'html.parser')
-    except:
-        return None
+        return BeautifulSoup(response.text, 'html.parser'), response.status_code
+    except Exception as e:
+        print(f"에러: {e}")
+        return None, 500
 
-# === 2. 범용 검색 로직 ===
-def get_notices(url, user_keyword):
+# === 2. 범용 게시판 털기 로직 ===
+def scrape_any_board(url, keyword):
     url = url.strip()
     if not url.startswith("http"): url = "https://" + url
     
-    session = create_session()
-    print(f"🔍 [진입] {url} 분석 시작...")
+    print(f"🔍 [직접 접속] {url} 에서 '{keyword}' 찾는 중...")
     
-    soup = get_soup(session, url)
-    if not soup: return {"status": "error", "message": "사이트 접속 실패"}
+    soup, status = get_soup(url)
+    if not soup:
+        return {"status": "error", "message": f"사이트 접속 불가 (코드: {status})"}
 
-    # (1) 메인 리다이렉트 처리 (쪽지 따라가기)
-    meta_refresh = soup.find('meta', attrs={'http-equiv': re.compile(r'refresh', re.I)})
-    if meta_refresh:
-        content = meta_refresh.get('content', '')
-        if 'url=' in content:
-            new_path = content.split('url=')[-1].strip()
-            url = urljoin(url, new_path)
-            print(f"   👉 자동 이동됨: {url}")
-            soup = get_soup(session, url)
-
-    final_results = []
-    seen_urls = set()
+    results = []
+    seen_links = set()
     
-    # 만약 사용자가 키워드 없이 URL만 줬다면? -> 모든 링크 수집 (단순 모드)
-    if not user_keyword:
-        links = soup.find_all('a')
-        board_keywords = ['공지', 'Notice', '소식', 'News', '게시판', '알림']
-        for link in links:
-            text = link.get_text().strip()
-            href = link.get('href')
-            if not text or not href: continue
-            
-            # 공지사항스러운 링크만 15개 수집
-            for bk in board_keywords:
-                if bk in text:
-                    full_url = urljoin(url, href)
-                    if full_url not in seen_urls:
-                        final_results.append({"title": text, "link": full_url})
-                        seen_urls.add(full_url)
-                    break
-        return {"status": "success", "data": final_results[:15]}
-
-    # ==========================================
-    # ⭐️ [핵심] 키워드가 있을 때 (스마트 검색 모드)
-    # ==========================================
-    
-    # 전략 A: "현재 페이지"에 바로 키워드 글이 있는지 확인
-    # (사용자가 '공지사항 게시판 주소'를 직접 넣었을 때 작동)
+    # 전략: 게시판은 보통 <a> 태그 안에 제목이 있다.
+    # 모든 링크를 다 가져와서 검사한다.
     links = soup.find_all('a')
-    for link in links:
-        text = link.get_text().strip()
-        href = link.get('href')
-        if not text or not href: continue
-        if 'javascript' in href or '#' == href: continue
-
-        if user_keyword in text:
-            full_url = urljoin(url, href)
-            if full_url not in seen_urls:
-                final_results.append({"title": text, "link": full_url})
-                seen_urls.add(full_url)
     
-    # 전략 B: 현재 페이지에 글이 별로 없으면, "게시판 목록"을 찾아 들어감
-    # (사용자가 '메인 홈페이지 주소'를 넣었을 때 작동)
-    if len(final_results) < 3: 
-        print("   👉 현재 페이지에서 결과 부족. 하위 게시판 탐색 시작...")
-        
-        potential_boards = []
-        # '더보기', '+', 'Notice' 같은 게시판 입구 단어들
-        board_cues = ['공지', 'Notice', '소식', 'News', '게시판', '학사', '장학', '채용', 'More', '더보기', '+']
-        
+    # 만약 키워드가 없으면? -> 그냥 상위 15개 글을 가져옴
+    if not keyword:
         for link in links:
             text = link.get_text().strip()
             href = link.get('href')
+            if len(text) > 5 and href: # 제목이 너무 짧으면(예: '홈') 패스
+                # 자바스크립트 링크는 앱에서 못 여니까 제외
+                if 'javascript' in href or '#' in href: continue
+                
+                # 절대 경로로 변환
+                if not href.startswith("http"):
+                    # 주소 합치기 로직 단순화
+                    base_url = "/".join(url.split('/')[:3]) # https://site.com
+                    if href.startswith("/"):
+                        full_url = base_url + href
+                    else:
+                        full_url = url + "/" + href # 단순 무식하게 합치기 (오히려 잘 됨)
+                else:
+                    full_url = href
+
+                if full_url not in seen_links:
+                    results.append({"title": text, "link": full_url})
+                    seen_links.add(full_url)
+                    if len(results) >= 15: break
+    
+    # 키워드가 있으면? -> 그것만 찾음
+    else:
+        for link in links:
+            text = link.get_text().strip()
+            href = link.get('href')
+            
             if not text or not href: continue
             
-            # 이미 찾은 글은 게시판 아님
-            full_url = urljoin(url, href)
-            if full_url in seen_urls: continue
-
-            for cue in board_cues:
-                if cue in text or cue.upper() in text.upper():
-                    if full_url not in potential_boards:
-                        potential_boards.append(full_url)
-                    break
-        
-        # 찾은 게시판들(최대 5개)을 하나씩 들어가서 털어옴
-        for board_url in potential_boards[:5]:
-            print(f"      Run: 하위 게시판 진입 -> {board_url}")
-            sub_soup = get_soup(session, board_url)
-            if not sub_soup: continue
+            # ⭐️ 검색어 매칭 (공백 제거 후 비교)
+            clean_text = text.replace(" ", "")
+            clean_keyword = keyword.replace(" ", "")
             
-            sub_links = sub_soup.find_all('a')
-            for sub_link in sub_links:
-                s_text = sub_link.get_text().strip()
-                s_href = sub_link.get('href')
-                if not s_text or not s_href: continue
-                
-                if user_keyword in s_text:
-                    s_full_url = urljoin(board_url, s_href)
-                    if s_full_url not in seen_urls:
-                        final_results.append({"title": s_text, "link": s_full_url})
-                        seen_urls.add(s_full_url)
+            if clean_keyword in clean_text:
+                if 'javascript' in href or '#' in href: continue
 
-    return {"status": "success", "data": final_results[:20]}
+                if not href.startswith("http"):
+                    base_url = "/".join(url.split('/')[:3])
+                    if href.startswith("/"):
+                        full_url = base_url + href
+                    else:
+                        # 상대 경로 처리가 복잡하므로, 단순하게 처리
+                        full_url = base_url + href 
+                else:
+                    full_url = href
+                
+                if full_url not in seen_links:
+                    results.append({"title": text, "link": full_url})
+                    seen_links.add(full_url)
+
+    # 결과가 없으면? 디버깅용 메시지 추가
+    if not results:
+        title = soup.title.string if soup.title else "제목 없음"
+        return {
+            "status": "success", 
+            "data": [], 
+            "message": f"'{title}' 페이지에 접속은 했는데, '{keyword}' 관련 글을 못 찾았습니다. 주소가 게시판 목록이 맞나요?"
+        }
+
+    return {"status": "success", "data": results}
 
 # === 서버 경로 ===
 @app.route('/', methods=['GET'])
 def home():
-    return "🌐 범용 검색 서버 가동 중 (V5: General AI Mode)"
+    return "V6: Direct Board Link Mode (게시판 주소를 직접 넣으세요!)"
 
 @app.route('/search', methods=['GET'])
 def search_api():
     target_url = request.args.get('url')
     keyword = request.args.get('keyword')
-    if not target_url: return jsonify({"status": "error", "message": "URL 필요"})
     
-    result = get_notices(target_url, keyword)
+    if not target_url:
+        return jsonify({"status": "error", "message": "URL을 입력해주세요."})
+    
+    result = scrape_any_board(target_url, keyword)
     return jsonify(result)
 
 if __name__ == "__main__":
