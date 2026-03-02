@@ -9,10 +9,9 @@ from urllib3.poolmanager import PoolManager
 from urllib3.util import ssl_
 import urllib3
 
-# === 플라스크 서버 설정 ===
 app = Flask(__name__)
 
-# === 보안 무시 어댑터 ===
+# === 보안 무시 어댑터 (기존과 동일) ===
 class LegacySSLAdapter(HTTPAdapter):
     def init_poolmanager(self, connections, maxsize, block=False):
         context = ssl_.create_urllib3_context(ciphers='DEFAULT@SECLEVEL=1')
@@ -20,13 +19,13 @@ class LegacySSLAdapter(HTTPAdapter):
         context.verify_mode = ssl.CERT_NONE
         self.poolmanager = PoolManager(num_pools=connections, maxsize=maxsize, block=block, ssl_context=context)
 
-# === 핵심 크롤링 로직 (함수로 분리) ===
-def get_notices(url):
+# === ⭐️ [수정됨] 키워드를 받아서 처리하는 함수 ===
+def get_notices(url, user_keyword):
     url = url.strip()
     if not url.startswith("http"):
         url = "https://" + url
     
-    result_list = [] # 결과를 담을 리스트
+    result_list = []
     
     try:
         session = requests.Session()
@@ -39,22 +38,27 @@ def get_notices(url):
         response.encoding = 'utf-8'
         soup = BeautifulSoup(response.text, 'html.parser')
 
-        # 리다이렉트(이동) 체크
+        # 리다이렉트 체크
         meta_refresh = soup.find('meta', attrs={'http-equiv': re.compile(r'refresh', re.I)})
         if meta_refresh:
             content = meta_refresh.get('content', '')
             if 'url=' in content:
                 new_path = content.split('url=')[-1].strip()
-                url = urljoin(url, new_path) # URL 업데이트
-                # 2차 접속
+                url = urljoin(url, new_path)
                 response = session.get(url, headers=headers, timeout=10, verify=False)
                 response.encoding = 'utf-8'
                 soup = BeautifulSoup(response.text, 'html.parser')
 
         # 링크 찾기
         links = soup.find_all('a')
-        keywords = ['공지', 'JBNU소식', '학사공지', '일반공지', '장학', 'Notice', 'news', 'News', '게시판'] 
-        found_urls = set() # 중복 방지용
+        
+        # ⭐️ [핵심] 사용자가 키워드를 줬으면 그것만 쓰고, 없으면 기본값 사용
+        if user_keyword:
+            keywords = [user_keyword] # 사용자가 입력한 단어 하나만 타겟팅
+        else:
+            keywords = ['공지', 'Notice', 'news', '게시판'] # 기본값
+
+        found_urls = set()
 
         for link in links:
             text = link.get_text().strip()
@@ -63,11 +67,11 @@ def get_notices(url):
             if not href or not text: continue
             if 'javascript' in href or '#' == href: continue
 
+            # 키워드 검사
             for key in keywords:
-                if key in text:
+                if key in text: # 대소문자 구분을 없애려면 .lower() 사용 가능
                     full_url = urljoin(url, href)
                     if full_url not in found_urls:
-                        # 아이폰에게 보낼 깔끔한 데이터 형식 (JSON)
                         result_list.append({
                             "title": text,
                             "link": full_url
@@ -75,24 +79,23 @@ def get_notices(url):
                         found_urls.add(full_url)
                     break 
         
-        return {"status": "success", "data": result_list[:10]} # 최대 10개
+        return {"status": "success", "data": result_list[:15]} # 15개 정도 가져오기
 
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
-# === 🌐 웹 서버 접속 경로 설정 ===
-# 아이폰이 '주소/search?url=학교주소' 로 접속하면 이 함수가 실행됨
+# === API 경로 설정 ===
 @app.route('/search', methods=['GET'])
 def search_api():
-    target_url = request.args.get('url') # 아이폰이 보낸 URL 받기
+    target_url = request.args.get('url')
+    keyword = request.args.get('keyword') # ⭐️ URL에서 키워드 꺼내기
+    
     if not target_url:
         return jsonify({"status": "error", "message": "URL을 입력해주세요."})
     
-    # 크롤링 실행!
-    result = get_notices(target_url)
-    return jsonify(result) # 결과를 JSON으로 변환해서 발사
+    # 크롤링 실행 (키워드 전달)
+    result = get_notices(target_url, keyword)
+    return jsonify(result)
 
-# === 서버 실행 ===
 if __name__ == "__main__":
-    # 내 컴퓨터(0.0.0.0)의 5001번 포트에서 서버를 켭니다.
     app.run(host='0.0.0.0', port=5001, debug=True)
