@@ -7,11 +7,11 @@ from requests.adapters import HTTPAdapter
 from urllib3.poolmanager import PoolManager
 from urllib3.util import ssl_
 import urllib3
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urljoin
 
 app = Flask(__name__)
 
-# === 1. 보안 설정 ===
+# === 1. 보안 인증서 무시 설정 (한국 관공서 필수) ===
 class LegacySSLAdapter(HTTPAdapter):
     def init_poolmanager(self, connections, maxsize, block=False):
         context = ssl_.create_urllib3_context(ciphers='DEFAULT@SECLEVEL=1')
@@ -23,28 +23,30 @@ def get_request(method, url, params=None, data=None):
     try:
         session = requests.Session()
         session.mount('https://', LegacySSLAdapter())
-        headers = {'User-Agent': 'Mozilla/5.0'}
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+        }
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         
         if method == 'GET':
-            response = session.get(url, headers=headers, params=params, timeout=8, verify=False)
+            response = session.get(url, headers=headers, params=params, timeout=10, verify=False)
         else: # POST
-            response = session.post(url, headers=headers, data=data, timeout=8, verify=False)
+            response = session.post(url, headers=headers, data=data, timeout=10, verify=False)
             
         response.encoding = 'utf-8' 
         return BeautifulSoup(response.text, 'html.parser'), response.url
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Connection Error: {e}")
         return None, ""
 
-# === 2. V19: 자동 학습형 하이브리드 검색 ===
-def search_universal_v19(target_url, keyword):
+# === 2. V20: 진짜 범용 검색 (Hidden Input + Multi-Param) ===
+def search_universal_v20(target_url, keyword):
     if not target_url.startswith("http"): target_url = "https://" + target_url
     
-    print(f"🚀 [V19 범용] {target_url} 분석 시작...")
+    print(f"🚀 [V20 분석 시작] {target_url}")
 
-    # 1단계: 빈손으로 접속해서 '기존 데이터' 훔쳐오기 (Scraping Hidden Inputs)
-    # 청원고 사이트처럼 URL이 안 바뀌는 곳은 페이지 안에 hidden input이 숨어있음
+    # (1) 일단 접속해서 사이트 구조 파악 (Hidden Input 털기)
+    # 청원고 같은 사이트는 게시판 ID 등이 hidden으로 숨겨져 있음
     soup_init, real_url = get_request('GET', target_url)
     if not soup_init: return []
 
@@ -56,109 +58,96 @@ def search_universal_v19(target_url, keyword):
     for k, v in query_params.items():
         base_payload[k] = v[0]
 
-    # HTML 안에 숨겨진 값(hidden input) 가져오기
-    # 이게 있어야 청원고 같은 사이트가 "어? 정상적인 요청이네?" 하고 받아줌
+    # HTML 안에 숨겨진 <input type="hidden"> 싹 긁어오기
     inputs = soup_init.find_all('input', {'type': 'hidden'})
     for inp in inputs:
         name = inp.get('name')
         value = inp.get('value')
         if name and value:
             base_payload[name] = value
-            # print(f"   🕵️ 숨겨진 데이터 발견: {name}={value}")
 
-    # 2단계: 검색어 변수명 시도 리스트 (학교 사이트용 searchWrd 추가!)
+    # (2) 검색어 변수명 후보군 (한국, 외국, 교육청, 워드프레스 총망라)
     param_names = [
-        "searchKeyword",   # 전북대, 공공기관
-        "searchWrd",       # ⭐️ 청원고 등 교육청 사이트 필수
-        "q",               # 구글
+        "searchKeyword",   # 전북대, 공공기관 표준
+        "searchWrd",       # ⭐️ 교육청(청원고) 표준
+        "srchWrd",         # 일부 학교
+        "q",               # 구글, 글로벌
         "query",           # 네이버
-        "srchWrd",         # 또 다른 학교 포맷
-        "s"                # 워드프레스
+        "s",               # 워드프레스
+        "stx"              # 그누보드
     ]
 
     all_results = []
     seen_links = set()
 
-    # 3단계: GET과 POST 번갈아가며 찌르기
-    for param_name in param_names:
-        # payload 복사 후 검색어 추가
-        current_payload = base_payload.copy()
-        current_payload[param_name] = keyword
-        current_payload['searchCondition'] = '0' # 혹시 모르니 추가
-        
-        # (A) GET 시도 (주소창 방식)
-        soup, _ = get_request('GET', target_url.split('?')[0], params=current_payload)
-        
-        # 결과 파싱
-        found = parse_results(soup, keyword, target_url, seen_links)
-        if found:
-            print(f"   ✅ [GET 성공] 변수명 '{param_name}'에서 {len(found)}개 발견!")
-            return found # 찾았으면 바로 리턴
+    # (3) GET(주소창)과 POST(숨김전송) 모두 시도
+    # 청원고는 POST 방식일 확률이 높음
+    methods = ['GET', 'POST']
 
-        # (B) POST 시도 (숨겨서 보내기 방식 - 청원고 가능성 높음)
-        # print(f"   👉 POST 시도: {param_name}={keyword}")
-        soup_post, _ = get_request('POST', target_url.split('?')[0], data=current_payload)
-        
-        found_post = parse_results(soup_post, keyword, target_url, seen_links)
-        if found_post:
-             print(f"   ✅ [POST 성공] 변수명 '{param_name}'에서 {len(found_post)}개 발견!")
-             return found_post
+    for method in methods:
+        for param_name in param_names:
+            # Payload 복사 및 검색어 주입
+            current_payload = base_payload.copy()
+            current_payload[param_name] = keyword
+            current_payload['searchCondition'] = '0' # 제목 검색 (혹시 모르니)
+            
+            # 요청 전송
+            base_url_only = real_url.split('?')[0]
+            if method == 'GET':
+                soup, final_url = get_request('GET', base_url_only, params=current_payload)
+            else:
+                soup, final_url = get_request('POST', base_url_only, data=current_payload)
+            
+            if not soup: continue
+
+            # 결과 파싱
+            links = soup.find_all('a')
+            found_count = 0
+            
+            for link in links:
+                text = link.get_text().strip()
+                href = link.get('href')
+                
+                if not text or not href: continue
+                if 'javascript' in href or '#' in href: continue
+                
+                # 키워드 매칭
+                if keyword.replace(" ", "") in text.replace(" ", ""):
+                    # URL 합치기
+                    full_url = urljoin(real_url, href)
+                    
+                    if full_url not in seen_links:
+                        all_results.append({"title": text, "link": full_url})
+                        seen_links.add(full_url)
+                        found_count += 1
+            
+            if found_count > 0:
+                print(f"   ✅ [성공] {method} 방식 / 변수명 '{param_name}' / {found_count}개 발견")
+                return all_results # 찾았으면 즉시 반환 (속도 최적화)
 
     return []
 
-# 결과 html에서 링크 찾는 함수 (공통)
-def parse_results(soup, keyword, base_url, seen_links):
-    if not soup: return []
-    results = []
-    links = soup.find_all('a')
-    
-    parsed_base = urlparse(base_url)
-
-    for link in links:
-        text = link.get_text().strip()
-        href = link.get('href')
-        
-        if not text or not href: continue
-        if 'javascript' in href or '#' in href: continue
-        
-        clean_text = text.replace(" ", "")
-        clean_keyword = keyword.replace(" ", "")
-        
-        if clean_keyword in clean_text:
-            # URL 합치기
-            if not href.startswith("http"):
-                if href.startswith("/"):
-                     full_url = f"{parsed_base.scheme}://{parsed_base.netloc}{href}"
-                else:
-                    path_dir = "/".join(parsed_base.path.split('/')[:-1])
-                    full_url = f"{parsed_base.scheme}://{parsed_base.netloc}{path_dir}/{href}"
-            else:
-                full_url = href
-            
-            if full_url not in seen_links:
-                results.append({"title": text, "link": full_url})
-                seen_links.add(full_url)
-    return results
-
 @app.route('/', methods=['GET'])
 def home():
-    return "V19: Universal Hybrid (Auto-Learning Input)"
+    return "V20: Server Running. (Port Binding Fixed)"
 
 @app.route('/search', methods=['GET'])
 def search_api():
     target_url = request.args.get('url')
     keyword = request.args.get('keyword')
     
-    if not target_url: return jsonify({"status": "error", "message": "URL 필요"})
-    if not keyword: return jsonify({"status": "error", "message": "키워드 필요"})
+    if not target_url: return jsonify({"status": "error", "message": "URL을 입력하세요."})
+    if not keyword: return jsonify({"status": "error", "message": "키워드를 입력하세요."})
 
-    results = search_universal_v19(target_url, keyword)
+    results = search_universal_v20(target_url, keyword)
     
     if not results:
-        return jsonify({"status": "success", "data": [], "message": "결과 없음 (GET/POST 모두 실패)"})
+        return jsonify({"status": "success", "data": [], "message": "검색 실패 (사이트 보안이 강력하거나 키워드가 없음)"})
         
     return jsonify({"status": "success", "data": results})
 
+# === 3. ⭐️ 포트 에러 해결의 핵심 ===
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5001))
+    # Render는 PORT라는 환경변수를 줍니다. 그걸 받아먹어야 합니다.
+    port = int(os.environ.get("PORT", 10000)) 
     app.run(host='0.0.0.0', port=port)
