@@ -9,7 +9,7 @@ import urllib3
 
 app = Flask(__name__)
 
-# === 1. 보안 설정 ===
+# === 보안 설정 ===
 class LegacySSLAdapter(HTTPAdapter):
     def init_poolmanager(self, connections, maxsize, block=False):
         context = ssl_.create_urllib3_context(ciphers='DEFAULT@SECLEVEL=1')
@@ -21,52 +21,38 @@ def get_soup(url):
     try:
         session = requests.Session()
         session.mount('https://', LegacySSLAdapter())
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
-        }
+        headers = {'User-Agent': 'Mozilla/5.0'}
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        response = session.get(url, headers=headers, timeout=10, verify=False)
+        
+        # ⭐️ [핵심 수정] 타임아웃을 3초로 줄임 (빨리빨리 넘어가기 위해)
+        response = session.get(url, headers=headers, timeout=3, verify=False)
         response.encoding = 'utf-8' 
         return BeautifulSoup(response.text, 'html.parser')
-    except Exception as e:
-        print(f"Error: {e}")
+    except:
         return None
 
-# === 2. V11: 주소 원형 보존 검색 (No-Cut Logic) ===
-def smart_search_v11(base_url, keyword):
+# === V12: 고속 검색 모드 (Fast Search) ===
+def smart_search_fast(base_url, keyword):
     base_url = base_url.strip()
     if not base_url.startswith("http"): base_url = "https://" + base_url
     
-    print(f"🚀 [V11 정밀 검색] 원본 주소 유지한 채 '{keyword}' 주입 시도")
+    print(f"🚀 [V12 고속 검색] '{keyword}' 검색 시작")
     
-    # ⭐️ 국내 웹사이트 표준 검색 변수들
-    search_params = [
-        "searchKeyword",  # 대학/공공기관 표준
-        "q",              # 구글 표준
-        "query",          # 네이버/포털 표준
-        "s",              # 워드프레스 표준
-        "srSearchVal"     # 구형 게시판
-    ]
+    # 순서 중요: 전북대는 searchKeyword를 쓰므로 맨 앞에 배치
+    search_params = ["searchKeyword", "q", "query", "s", "srSearchVal"]
     
     all_results = []
     seen_links = set()
-    
-    # URL 연결자 결정 (이미 ?가 있으면 &를 쓰고, 없으면 ?를 씀)
-    # 🚨 실수 수정: 기존 파라미터를 절대 삭제하지 않음!
     connector = "&" if "?" in base_url else "?"
     
     for param in search_params:
-        # 예: .../sub01.do?menu=101 + & + searchKeyword=교비
         target_url = f"{base_url}{connector}{param}={keyword}"
-        
-        # 꿀팁: 한국 사이트는 searchCondition(검색조건)이 없으면 검색 안 되는 경우가 있음. '0'(제목)을 추가해봄.
-        if param == "searchKeyword":
-            target_url += "&searchCondition=0"
+        if param == "searchKeyword": target_url += "&searchCondition=0"
 
-        # print(f"   👉 찌르는 중: {target_url}") # 로그 확인용
+        # print(f"👉 시도: {param}") # 로그 줄임
         
         soup = get_soup(target_url)
-        if not soup: continue
+        if not soup: continue # 3초 안에 답 없으면 바로 다음으로!
         
         links = soup.find_all('a')
         found_count = 0
@@ -74,24 +60,18 @@ def smart_search_v11(base_url, keyword):
         for link in links:
             text = link.get_text().strip()
             href = link.get('href')
-            
             if not text or not href: continue
             if 'javascript' in href or '#' in href: continue
             
             clean_text = text.replace(" ", "")
             clean_keyword = keyword.replace(" ", "") if keyword else ""
             
-            # 검색 결과 매칭
             if clean_keyword in clean_text:
-                # URL 합치기
                 if not href.startswith("http"):
-                    # 절대 경로 변환 로직 강화
                     if href.startswith("/"):
-                        # 도메인만 남기고 합치기 (https://jbnu.ac.kr + /web/...)
                         domain = "/".join(base_url.split('/')[:3])
                         full_url = domain + href
                     else:
-                        # 현재 경로 기준 합치기 (쿼리 스트링 제거 후 결합)
                         url_path = base_url.split('?')[0]
                         parent_path = "/".join(url_path.split('/')[:-1])
                         full_url = parent_path + "/" + href
@@ -103,34 +83,33 @@ def smart_search_v11(base_url, keyword):
                     seen_links.add(full_url)
                     found_count += 1
         
+        # 하나라도 찾으면 즉시 종료 (속도 최우선)
         if found_count > 0:
-            print(f"   ✅ 발견! '{param}' 파라미터가 정답이었습니다.")
+            print(f"   ✅ '{param}'에서 {found_count}개 발견! 탐색 종료.")
             break
             
     return all_results
 
-# === 서버 경로 ===
 @app.route('/', methods=['GET'])
 def home():
-    return "V11: No-Cut Search Injector (주소 원형 보존 모드)"
+    return "V12: High-Speed Search Mode (타임아웃 단축)"
 
 @app.route('/search', methods=['GET'])
 def search_api():
     target_url = request.args.get('url')
     keyword = request.args.get('keyword')
+    if not target_url: return jsonify({"status": "error", "message": "URL 필요"})
     
-    if not target_url:
-        return jsonify({"status": "error", "message": "URL 필요"})
-    
-    # 키워드가 없으면 그냥 기본 긁어오기 (상위 15개)
+    # 키워드 없으면 그냥 긁어오기
     if not keyword:
-        # (기본 로직 생략 - 검색어 있을 때가 중요하므로)
-        return jsonify({"status": "success", "data": [], "message": "키워드를 입력해야 검색됩니다."})
-        
-    results = smart_search_v11(target_url, keyword)
+         # (단순 긁어오기 로직은 V7과 동일하다고 가정, 여기선 생략하고 빈 리스트 리턴하거나 기존 scrape_any_board 사용)
+         # 편의상 검색 로직만 호출합니다. 키워드 없으면 0개 리턴됨.
+         return jsonify({"status": "success", "data": [], "message": "키워드를 입력해주세요."})
+
+    results = smart_search_fast(target_url, keyword)
     
     if not results:
-        return jsonify({"status": "success", "data": [], "message": "검색 결과 0건 (주소 뒤에 검색어가 안 먹히는 사이트일 수 있습니다)"})
+        return jsonify({"status": "success", "data": [], "message": "검색 결과 0건"})
         
     return jsonify({"status": "success", "data": results})
 
