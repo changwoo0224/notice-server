@@ -6,7 +6,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.poolmanager import PoolManager
 from urllib3.util import ssl_
 import urllib3
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+from urllib.parse import urlparse, parse_qs
 
 app = Flask(__name__)
 
@@ -18,7 +18,7 @@ class LegacySSLAdapter(HTTPAdapter):
         context.verify_mode = ssl.CERT_NONE
         self.poolmanager = PoolManager(num_pools=connections, maxsize=maxsize, block=block, ssl_context=context)
 
-def get_soup(url):
+def get_soup(url, params=None):
     try:
         session = requests.Session()
         session.mount('https://', LegacySSLAdapter())
@@ -26,20 +26,50 @@ def get_soup(url):
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
         }
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        response = session.get(url, headers=headers, timeout=5, verify=False)
+        
+        # ⭐️ [핵심] params를 따로 넘겨서 requests 라이브러리가 알아서 인코딩하게 함
+        response = session.get(url, headers=headers, params=params, timeout=10, verify=False)
         response.encoding = 'utf-8' 
-        return BeautifulSoup(response.text, 'html.parser')
-    except:
-        return None
+        return BeautifulSoup(response.text, 'html.parser'), response.url
+    except Exception as e:
+        print(f"Error: {e}")
+        return None, ""
 
-# === 2. 링크 추출기 (공통 함수) ===
-def extract_links(soup, base_url, keyword):
+# === 2. V15: 파라미터 정밀 조립기 ===
+def precise_search(target_url, keyword):
+    if not target_url.startswith("http"): target_url = "https://" + target_url
+    
+    print(f"🚀 [V15] 정밀 분석 시작: {target_url} + 키워드: {keyword}")
+
+    # 1. URL에서 ? 앞부분(Base)과 뒷부분(Params)을 분리
+    parsed = urlparse(target_url)
+    base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+    
+    # 기존 파라미터 (menu=2377 등)를 딕셔너리로 변환
+    # 예: {'menu': ['2377'], 'pageIndex': ['1']}
+    current_params = parse_qs(parsed.query)
+    
+    # 딕셔너리 단순화 (리스트 벗기기)
+    clean_params = {k: v[0] for k, v in current_params.items()}
+    
+    # 2. 검색어 강제 주입 (덮어쓰기)
+    # 전북대 표준 파라미터
+    clean_params['searchKeyword'] = keyword
+    clean_params['searchCondition'] = '0' # 0: 제목, 1: 내용, 2: 작성자
+    
+    # 3. 요청 보내기 (requests가 알아서 한글을 %EA%B5... 로 변환해줌)
+    soup, final_url = get_soup(base_url, params=clean_params)
+    
+    print(f"   👉 실제로 접속한 URL: {final_url}") # 로그 확인용
+    
+    if not soup:
+        return []
+
+    # 4. 결과 추출
     results = []
     seen_links = set()
-    
-    if not soup: return []
-
     links = soup.find_all('a')
+    
     for link in links:
         text = link.get_text().strip()
         href = link.get('href')
@@ -47,100 +77,31 @@ def extract_links(soup, base_url, keyword):
         if not text or not href: continue
         if 'javascript' in href or '#' in href: continue
         
+        # 검색 결과 매칭 (공백 제거 후 비교)
         clean_text = text.replace(" ", "")
         clean_keyword = keyword.replace(" ", "")
         
-        # 키워드 포함 여부 확인
         if clean_keyword in clean_text:
-            # URL 절대경로 변환
+            # 주소 합치기 로직
             if not href.startswith("http"):
-                parsed_base = urlparse(base_url)
                 if href.startswith("/"):
-                    # 도메인 + 경로
-                    full_url = f"{parsed_base.scheme}://{parsed_base.netloc}{href}"
+                    full_url = f"{parsed.scheme}://{parsed.netloc}{href}"
                 else:
-                    # 현재 경로 + 상대 경로
-                    path = "/".join(parsed_base.path.split('/')[:-1])
-                    full_url = f"{parsed_base.scheme}://{parsed_base.netloc}{path}/{href}"
+                    # 상대 경로 처리
+                    path_dir = "/".join(parsed.path.split('/')[:-1])
+                    full_url = f"{parsed.scheme}://{parsed.netloc}{path_dir}/{href}"
             else:
                 full_url = href
             
             if full_url not in seen_links:
                 results.append({"title": text, "link": full_url})
                 seen_links.add(full_url)
-    
+
     return results
 
-# === 3. V14 하이브리드 검색 로직 ===
-def hybrid_search(target_url, keyword):
-    if not target_url.startswith("http"): target_url = "https://" + target_url
-    
-    print(f"🚀 [V14] 하이브리드 검색 시작: {target_url} (키워드: {keyword})")
-    
-    all_results = []
-    
-    # ---------------------------------------------------------
-    # [1단계] 스마트 검색 주입 (전북대, 네이버, 워드프레스 등)
-    # ---------------------------------------------------------
-    parsed_url = urlparse(target_url)
-    current_params = parse_qs(parsed_url.query)
-    
-    # 전 세계 주요 검색 파라미터 전략
-    strategies = [
-        # 1. 한국 공공기관/대학 (searchCondition 필수)
-        {"searchKeyword": keyword, "searchCondition": "0"}, 
-        # 2. 구글/글로벌 표준
-        {"q": keyword},
-        # 3. 네이버/포털
-        {"query": keyword},
-        # 4. 워드프레스/블로그
-        {"s": keyword},
-        # 5. 구형 게시판
-        {"srSearchVal": keyword},
-        # 6. 그누보드/한국 커뮤니티
-        {"stx": keyword} 
-    ]
-    
-    # 전략들을 하나씩 시도
-    for strategy in strategies:
-        # 기존 파라미터 유지하면서 새 파라미터 덮어쓰기
-        new_params = current_params.copy()
-        for k, v in strategy.items():
-            new_params[k] = v
-            
-        new_query = urlencode(new_params, doseq=True)
-        search_url = urlunparse((
-            parsed_url.scheme, parsed_url.netloc, parsed_url.path,
-            parsed_url.params, new_query, parsed_url.fragment
-        ))
-        
-        # print(f"   👉 검색 시도: {search_url}")
-        soup = get_soup(search_url)
-        found_links = extract_links(soup, search_url, keyword)
-        
-        if found_links:
-            print(f"   ✅ [성공] 자동 검색('{list(strategy.keys())[0]}')으로 {len(found_links)}개 발견!")
-            return found_links # 찾았으면 바로 반환 (Best Case)
-
-    # ---------------------------------------------------------
-    # [2단계] 최후의 수단: 그냥 입력된 페이지 긁기 (Fallback)
-    # ---------------------------------------------------------
-    print("   ⚠️ 자동 검색 실패. 입력된 페이지를 직접 뒤집니다.")
-    
-    # 사용자가 준 URL 그대로 접속
-    soup = get_soup(target_url)
-    found_links = extract_links(soup, target_url, keyword)
-    
-    if found_links:
-        print(f"   ✅ [성공] 페이지 직접 분석으로 {len(found_links)}개 발견!")
-        return found_links
-        
-    return []
-
-# === 서버 경로 ===
 @app.route('/', methods=['GET'])
 def home():
-    return "V14: Hybrid Universal Engine (검색 + 직접수집)"
+    return "V15: Precision Parameter Engine (파라미터 정밀 제어 모드)"
 
 @app.route('/search', methods=['GET'])
 def search_api():
@@ -148,12 +109,17 @@ def search_api():
     keyword = request.args.get('keyword')
     
     if not target_url: return jsonify({"status": "error", "message": "URL 필요"})
-    if not keyword: return jsonify({"status": "success", "data": [], "message": "키워드 필요"})
+    if not keyword: return jsonify({"status": "error", "message": "키워드 필요"})
 
-    results = hybrid_search(target_url, keyword)
+    results = precise_search(target_url, keyword)
     
     if not results:
-        return jsonify({"status": "success", "data": [], "message": "검색 결과 0건. (검색된 화면의 주소를 넣어보세요)"})
+        # 실패 시 팁 제공
+        return jsonify({
+            "status": "success", 
+            "data": [], 
+            "message": "결과 없음. (Render 로그에서 '실제로 접속한 URL'을 확인해보세요)"
+        })
         
     return jsonify({"status": "success", "data": results})
 
